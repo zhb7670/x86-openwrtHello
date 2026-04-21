@@ -1,0 +1,688 @@
+#
+# Copyright (c) 2022-2026 SMALLPROGRAM
+# Modified for x86-openwrtHello (X86 only)
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/zhb7670/x86-openwrtHello
+# Description: Build OpenWrt X86 firmware using GitHub Actions
+#
+
+name: Build-OpenWrt-X86
+
+on:
+  repository_dispatch:
+    types: [openwrt_source_update_v6]
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+      force_rebuild:
+        description: 'Build from scratch'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+env:
+  UPLOAD_BIN_DIR: false
+  UPLOAD_FIRMWARE: true
+  UPLOAD_ARTIFACT: true
+  UPLOAD_RELEASE: true
+  TZ: Asia/Shanghai
+
+jobs:
+  job_init:
+    runs-on: ubuntu-latest
+    name: Init
+    outputs:
+      output_release_tag: ${{ steps.gen_release_tag.outputs.release_tag }}
+      platforms: ${{ steps.read-platforms.outputs.matrix }}
+      platforms_source: ${{ steps.read-platforms.outputs.source_matrix_json }}
+    steps:
+      - name: Generate Tag Name
+        id: gen_release_tag
+        run: |
+          echo "release_tag=x86-openwrt_$(date +"%Y.%m.%d_%H.%M.%S")" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Read Platforms From File
+        id: read-platforms
+        run: |
+          bash compile_script/platforms.sh
+
+  job_source_init:
+    needs: job_init
+    runs-on: ${{ matrix.value.OS }}
+    name: Source-Init-${{ matrix.source_code_platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.job_init.outputs.platforms_source) }}
+    steps:
+      - name: Init System
+        id: init
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown -R $USER:$GROUPS /workdir
+          cd /workdir
+          sudo mkdir -p output
+          sudo chown -R $USER:$GROUPS /workdir/output
+          ln -sf /workdir/output $GITHUB_WORKSPACE/output
+          df -hT
+
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Clone Source Code
+        working-directory: /workdir
+        run: |
+          git clone -b ${{matrix.value.REPO_BRANCH}} --single-branch ${{ matrix.value.REPO_URL }} openwrt
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+
+      - name: Run DIY Part 1 Script
+        run: |
+          chmod +x ${{ matrix.value.DIY_P1_SH }}
+          cd openwrt
+          $GITHUB_WORKSPACE/${{ matrix.value.DIY_P1_SH }}
+          echo "feeds_Conf:------------------------"
+          cat feeds.conf.default
+
+      - name: Update Feeds
+        run: cd openwrt && ./scripts/feeds update -a
+
+      - name: Install Feeds
+        run: cd openwrt && ./scripts/feeds install -a
+
+      - name: Pull the latest changes and Create temporary branch
+        run: |
+          git fetch origin
+          git reset --hard origin/${{ github.ref_name }}
+          git checkout -b temp-${{ matrix.source_code_platform }}
+
+      - name: Run DIY Part 2 Script
+        run: |
+          chmod +x ${{ matrix.value.DIY_P2_SH }}
+          cd openwrt
+          $GITHUB_WORKSPACE/${{ matrix.value.DIY_P2_SH }}
+
+      - name: Make Defconfig Custom Configuration
+        run: |
+          chmod +x compile_script/step01_make_defconfig.sh
+          cd openwrt
+          $GITHUB_WORKSPACE/compile_script/step01_make_defconfig.sh "${{ matrix.source_code_platform }}" "${{ matrix.value.CONFIGS }}"
+
+      - name: Merge and push changes with "theirs" strategy
+        run: |
+          git checkout temp-${{ matrix.source_code_platform }}
+          git add .
+
+          if ! git diff --cached --quiet; then
+            git config user.name "smallprogram"
+            git config user.email "smallprogram@foxmail.com"
+            git commit -m "Configuration: update code for ${{ matrix.source_code_platform }}"
+
+            git checkout ${{ github.ref_name }}
+            git fetch origin
+            git reset --hard origin/${{ github.ref_name }}
+
+            git checkout temp-${{ matrix.source_code_platform }}
+            git merge origin/${{ github.ref_name }} --no-ff --strategy-option theirs --no-edit || {
+              echo "Merge conflict in temp branch, please resolve manually."
+              exit 100
+            }
+
+            git checkout ${{ github.ref_name }}
+            git merge temp-${{ matrix.source_code_platform }} --strategy-option theirs --no-edit
+            git push origin ${{ github.ref_name }} --force
+            git branch -d temp-${{ matrix.source_code_platform }} || echo "Local temp-${{ matrix.source_code_platform }} not found"
+            git push origin --delete temp-${{ matrix.source_code_platform }} || echo "Remote temp-${{ matrix.source_code_platform }} not found"
+          else
+            echo "No changes to commit."
+          fi
+
+      - name: Generate Source Packages
+        working-directory: /workdir
+        id: generate_image
+        run: |
+          tar -czf output/output.tar.gz openwrt/
+          echo "SOURCE_PATH=$PWD" >> $GITHUB_OUTPUT
+
+      - name: Upload Source To Artifact
+        uses: actions/upload-artifact@v7
+        if: steps.generate_image.outcome == 'success'
+        with:
+          name: Source_${{ matrix.source_code_platform }}
+          path: ${{ steps.generate_image.outputs.SOURCE_PATH }}/output/output.tar.gz
+          retention-days: 5
+
+      - name: Generate Git Log
+        id: git_log
+        run: |
+          chmod +x compile_script/step03_generate_git_log.sh
+          $GITHUB_WORKSPACE/compile_script/step03_generate_git_log.sh "${{ matrix.source_code_platform }}"
+
+      - name: Upload Git Log To Artifact
+        uses: actions/upload-artifact@v7
+        if: steps.git_log.outputs.status == 'success'
+        with:
+          name: git_log_${{ matrix.source_code_platform }}
+          path: git_log_${{ matrix.source_code_platform }}.txt
+          retention-days: 5
+
+      - name: Generate Release Tag
+        id: tag
+        run: |
+          chmod +x compile_script/step02_generate_release_tag.sh
+          $GITHUB_WORKSPACE/compile_script/step02_generate_release_tag.sh "${{ needs.job_init.outputs.output_release_tag }}" "${{ matrix.source_code_platform }}" "${{ matrix.value.CONFIGS }}"
+
+      - name: Upload Release Tag To Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release_${{ matrix.source_code_platform }}
+          path: release_${{ matrix.source_code_platform }}.txt
+          retention-days: 5
+
+  job_generate_release_tag:
+    needs: [job_init, job_source_init]
+    runs-on: ubuntu-latest
+    name: Generate-Release-Tag-And-Git-Log
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Pull the latest changes and Create temporary branch
+        run: |
+          git fetch origin
+          git reset --hard origin/${{ github.ref_name }}
+          git checkout -b temp-tag-gitlog
+
+      - name: Download Git Log From Artifacts
+        id : download_gitlog
+        uses: actions/download-artifact@v8
+        with:
+          pattern: git_log_*
+          merge-multiple: true
+
+      - name: Download Release Tag From Artifacts
+        id : download_releasetag
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release_*
+          merge-multiple: true
+
+      - name: Generate Release Tag
+        id: tag
+        run: |
+          chmod +x compile_script/step06_update_git_log.sh
+          $GITHUB_WORKSPACE/compile_script/step06_update_git_log.sh "${{ needs.job_init.outputs.output_release_tag }}"
+
+      - name: Upload Tags To Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release_tag
+          path: release.txt
+          retention-days: 5
+
+      - name: Create Release Tag
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_ADMIN_PAT }}
+        with:
+          tag_name: ${{ needs.job_init.outputs.output_release_tag }}
+          body_path: release.txt
+
+      - name: Merge and push changes with "theirs" strategy
+        run: |
+          git checkout temp-tag-gitlog
+          rm -rf release.txt
+          git add .
+
+          if ! git diff --cached --quiet; then
+            git config user.name "smallprogram"
+            git config user.email "smallprogram@foxmail.com"
+            git commit -m "Git Log: update code"
+            git checkout ${{ github.ref_name }}
+            git fetch origin
+            git reset --hard origin/${{ github.ref_name }}
+            git checkout temp-tag-gitlog
+            git merge origin/${{ github.ref_name }} --no-ff --strategy-option theirs --no-edit || { exit 100; }
+            git checkout ${{ github.ref_name }}
+            git merge temp-tag-gitlog --strategy-option theirs --no-edit
+            git push origin ${{ github.ref_name }} --force
+            git branch -d temp-tag-gitlog || echo "Local temp-tag-gitlog not found"
+            git push origin --delete temp-tag-gitlog || echo "Remote temp-tag-gitlog not found"
+          else
+            echo "No changes to commit."
+          fi
+
+  job_build:
+    needs: [job_init, job_source_init, job_generate_release_tag]
+    runs-on: ${{ matrix.value.OS }}
+    if: ${{ always() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.job_init.outputs.platforms) }}
+    name: Build-${{ matrix.source_code_platform }}-${{ matrix.platform }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Matrix Status
+        id: matrix_status
+        run: |
+            chmod +x compile_script/matrix_job_status.sh
+            $GITHUB_WORKSPACE/compile_script/matrix_job_status.sh "${{ github.token }}" "${{ github.repository }}" "${{ github.run_id }}" "${{ fromJSON(github.run_attempt) }}" "Build-${{ matrix.source_code_platform }}-${{ matrix.platform }}"
+
+      - name: Server Info
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+            echo "---------------------CPU Info--------------------"
+            lscpu
+            echo "---------------------RAM Info--------------------"
+            free -h
+
+      - name: Initialization Environment
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          sudo mkdir -p /workdir
+          sudo chown -R $USER:$GROUPS /workdir
+          df -hT
+
+      - name: Maximize Build Space
+        uses: smallprogram/maximize-build-diskspace@main
+        if: steps.matrix_status.outputs.status != 'success'
+        with:
+          root-reserve-mb: 3072
+          swap-size-mb: 4096
+          remove-dotnet: 'true'
+          remove-android: 'true'
+          remove-haskell: 'true'
+          remove-codeql: 'true'
+          remove-docker-images: 'true'
+          build-mount-path: '/workdir'
+
+      - name: Install Packages
+        if: steps.matrix_status.outputs.status != 'success'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo -E apt-get -qq update
+          sudo -E apt-get -qq install $(curl -fsSL https://github.com/zhb7670/x86-openwrtHello/raw/main/diy_script/${{ matrix.source_code_platform }}_dependence)
+          sudo timedatectl set-timezone "$TZ"
+
+      - name: Initialization Directory
+        working-directory: /workdir
+        id: init_directory
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          sudo mkdir -p openwrt
+          sudo mkdir -p download
+          sudo chown -R $USER:$GROUPS /workdir/openwrt
+          sudo chown -R $USER:$GROUPS /workdir/download
+          ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
+          ln -sf /workdir/download $GITHUB_WORKSPACE/download
+
+      - name: Relocate Docker to /workdir
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          echo "==== 1. 停止 Docker 服务 ===="
+          sudo systemctl stop docker
+          echo "==== 2. 迁移 Docker 数据目录到 /workdir ===="
+          sudo mkdir -p /workdir/docker
+          echo '{"data-root": "/workdir/docker"}' | sudo tee /etc/docker/daemon.json
+          echo "==== 3. 重启 Docker 服务 ===="
+          sudo systemctl start docker
+          echo "==== 4. 验证迁移是否成功 ===="
+          docker info | grep "Docker Root Dir"
+
+      - name: Login to GitHub Container Registry
+        if: steps.matrix_status.outputs.status != 'success'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.MY_ADMIN_PAT}}
+
+      - name: Download Source From Artifacts
+        id : download
+        if: steps.matrix_status.outputs.status != 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: Source_${{ matrix.source_code_platform }}
+          path: download
+
+      - name: Extract Pristine Source
+        if: steps.matrix_status.outputs.status != 'success'
+        working-directory: /workdir
+        run: |
+          tar -xzf download/output.tar.gz
+          rm -rf download/output.tar.gz
+          sudo chown -R $USER:$GROUPS /workdir/openwrt
+
+      - name: Git Restore Mtime (True SSoT)
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          cd /workdir/openwrt
+          echo "==== 遍历所有 Git 仓库并精准还原真实提交时间 ===="
+          find . -name ".git" -type d | while read gitdir; do
+              repo_dir=$(dirname "$gitdir")
+              echo "-> 正在处理 Git 仓库: $repo_dir"
+              cd "/workdir/openwrt/$repo_dir"
+              git log --format=%at --name-only | perl -ane '
+                if (/^(\d+)$/) { $t = $1; }
+                elsif (/^(\S+)$/) {
+                  $f = $1;
+                  if (-e $f && !-d $f && !$seen{$f}) {
+                    utime($t, $t, $f);
+                    $seen{$f} = 1;
+                  }
+                }
+              '
+              cd /workdir/openwrt
+          done
+
+      - name: Restore Entire OpenWrt Cache from GHCR
+        id: restore_cache
+        if: steps.matrix_status.outputs.status != 'success' && github.event.inputs.force_rebuild != 'true'
+        run: |
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PLATFORM_NAME=$(echo "${{ matrix.source_code_platform }}-${{ matrix.platform }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/$REPO_OWNER/openwrt-base-cache-$PLATFORM_NAME:latest"
+
+          if docker pull $IMAGE_NAME; then
+            echo "Cache found! Extracting..."
+            docker create --name cache_container $IMAGE_NAME /bin/true
+            docker cp cache_container:/openwrt/build_dir /workdir/openwrt/ 2>/dev/null || true
+            docker cp cache_container:/openwrt/staging_dir /workdir/openwrt/ 2>/dev/null || true
+            docker rm cache_container
+            sudo chown -R $USER:$GROUPS /workdir/openwrt/build_dir /workdir/openwrt/staging_dir 2>/dev/null || true
+          else
+            echo "No cache found. This will be a clean build."
+          fi
+
+      - name: Load Configuration
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          [ -e ${{ matrix.value.CONFIGS }}/${{ matrix.platform }}.config ] && cp -r ${{ matrix.value.CONFIGS }}/${{ matrix.platform }}.config openwrt/.config
+          cd openwrt
+          make defconfig
+
+      - name: Download Package
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          cd $GITHUB_WORKSPACE/openwrt
+          make download -j8
+          find dl -size -1024c -exec rm -f {} \;
+
+      - name: SSH connection to Actions
+        uses: mxschmitt/action-tmate@v3.23
+        if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+
+      - name: Compile Base (Tools, Toolchain, Kernel)
+        id: compile_base
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          cd openwrt
+          touch /workdir/base_compilation_marker
+          echo "==== 1. 编译系统工具 ===="
+          make tools/compile -j$(nproc) || exit 1
+          echo "==== 2. 编译交叉工具链 ===="
+          make toolchain/compile -j$(nproc) || exit 1
+          echo "==== 3. 编译 Linux 内核 ===="
+          make target/compile -j$(nproc) || exit 1
+
+      - name: Checkpoint Cache (Save Base to GHCR)
+        if: steps.compile_base.outcome == 'success' && github.event.inputs.force_rebuild != 'true'
+        run: |
+          echo "==== 1. 自动修剪冗余版本 ===="
+          cd /workdir
+          for linux_dir in openwrt/build_dir/target-*/linux-*/; do
+              [ -d "$linux_dir" ] && (cd "$linux_dir" && ls -dt linux-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+          done
+          [ -d "openwrt/build_dir" ] && (cd openwrt/build_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+          if [ -d "openwrt/staging_dir" ]; then
+              (cd openwrt/staging_dir && ls -dt target-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+              (cd openwrt/staging_dir && ls -dt toolchain-* 2>/dev/null | tail -n +2 | xargs -I {} rm -rf "{}")
+          fi
+
+          echo "==== 2. 探测 Base 是否更新 ===="
+          CHANGED_BASE=$(find openwrt/build_dir openwrt/staging_dir -type f -newer /workdir/base_compilation_marker ! -path "*/stamp/*" 2>/dev/null | wc -l)
+          if [ "$CHANGED_BASE" -eq 0 ]; then
+              echo "🎉 Base 阶段命中旧缓存，跳过本次 Checkpoint 存档！"
+              exit 0
+          fi
+
+          echo "==== 3. 构建缓存镜像 ===="
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PLATFORM_NAME=$(echo "${{ matrix.source_code_platform }}-${{ matrix.platform }}" | tr '[:upper:]' '[:lower:]')
+          IMAGE_NAME="ghcr.io/$REPO_OWNER/openwrt-base-cache-$PLATFORM_NAME:latest"
+
+          mkdir -p layer1/openwrt/build_dir layer1/openwrt/staging_dir
+          mkdir -p layer2/openwrt/build_dir layer2/openwrt/staging_dir
+          mkdir -p layer3/openwrt/build_dir layer3/openwrt/staging_dir
+          mkdir -p layer4/openwrt
+
+          sudo cp -al openwrt/build_dir/toolchain-* ./layer1/openwrt/build_dir/ 2>/dev/null || true
+          sudo cp -al openwrt/staging_dir/toolchain-* ./layer1/openwrt/staging_dir/ 2>/dev/null || true
+          sudo cp -al openwrt/build_dir/host ./layer2/openwrt/build_dir/ 2>/dev/null || true
+          sudo cp -al openwrt/staging_dir/host ./layer2/openwrt/staging_dir/ 2>/dev/null || true
+          sudo cp -al openwrt/build_dir/target-* ./layer3/openwrt/build_dir/ 2>/dev/null || true
+          sudo cp -al openwrt/staging_dir/target-* ./layer3/openwrt/staging_dir/ 2>/dev/null || true
+          sudo rsync -a --exclude="toolchain-*" --exclude="host" --exclude="target-*" openwrt/build_dir/ layer4/openwrt/build_dir/
+          sudo rsync -a --exclude="toolchain-*" --exclude="host" --exclude="target-*" openwrt/staging_dir/ layer4/openwrt/staging_dir/
+
+          echo "FROM alpine:latest" > Dockerfile
+          echo "COPY layer1 /" >> Dockerfile
+          echo "COPY layer2 /" >> Dockerfile
+          echo "COPY layer3 /" >> Dockerfile
+          echo "COPY layer4 /" >> Dockerfile
+
+          docker build -t $IMAGE_NAME .
+          docker push $IMAGE_NAME
+
+          sudo rm -rf layer1 layer2 layer3 layer4 Dockerfile
+          echo "✅ Base 缓存已保存！"
+
+      - name: Compile Packages and Firmware
+        id: compile
+        if: steps.matrix_status.outputs.status != 'success' && !cancelled()
+        run: |
+          cd openwrt
+          df -h
+          if [[ ${{ fromJSON(github.run_attempt) }} == 3 ]]; then
+              make -j$(nproc) V=s
+              MAKE_EXIT_CODE=$?
+              exit $MAKE_EXIT_CODE
+          else
+              make -j$(nproc)
+              MAKE_EXIT_CODE=$?
+              exit $MAKE_EXIT_CODE
+          fi
+
+      - name: Upload Bin Directory To Artifact
+        uses: actions/upload-artifact@v7
+        if: steps.compile.outcome == 'success' && env.UPLOAD_BIN_DIR == 'true' && steps.matrix_status.outputs.status != 'success'
+        with:
+          name: OpenWrt_bin_${{ matrix.source_code_platform }}_${{ matrix.platform }}
+          path: openwrt/bin
+
+      - name: Organize Files
+        id: organize
+        if: steps.compile.outcome == 'success' && env.UPLOAD_FIRMWARE == 'true' && steps.matrix_status.outputs.status != 'success' && !cancelled()
+        run: |
+          cd $GITHUB_WORKSPACE/openwrt/bin/targets/*/*
+          mkdir -p feeds_packages
+          firmware_path=$PWD
+          cd $GITHUB_WORKSPACE/openwrt/bin/packages/*/
+          mv * $firmware_path/feeds_packages
+          cd $firmware_path
+
+          zip -r buildinfo_${{ matrix.source_code_platform }}_${{ matrix.platform }}.zip */
+          find . -maxdepth 1 -type f ! -name '*-*-*' ! -name '*.zip' -exec zip buildinfo_${{ matrix.source_code_platform }}_${{ matrix.platform }}.zip {} +
+          find . -mindepth 1 ! \( -name '*-*-*' -o -name '*.zip' \) -exec rm -rf {} +
+
+          if [[ "${{ matrix.source_code_platform }}" == "lede" ]]; then
+              for file in openwrt-*; do
+                  if [[ -f "$file" ]]; then
+                      mv "$file" "${file/openwrt-/lean-}"
+                  fi
+              done
+          fi
+
+          echo "FIRMWARE=$firmware_path" >> $GITHUB_OUTPUT
+
+      - name: Upload Firmware Directory To Artifact
+        uses: actions/upload-artifact@v7
+        if: steps.organize.outcome == 'success' && env.UPLOAD_ARTIFACT == 'true' && steps.matrix_status.outputs.status != 'success' && !cancelled()
+        with:
+          name: ${{ matrix.source_code_platform }}_${{ matrix.platform }}_firmware
+          path: ${{ steps.organize.outputs.FIRMWARE }}
+
+  job_upload_release:
+    needs: [job_init, job_source_init, job_generate_release_tag, job_build]
+    runs-on: ${{ matrix.value.OS }}
+    if: ${{ always() && !cancelled() }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.job_init.outputs.platforms) }}
+    name: Upload-${{ matrix.source_code_platform }}-${{ matrix.platform }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Matrix Status
+        id: matrix_status
+        run: |
+            chmod +x compile_script/matrix_job_status.sh
+            $GITHUB_WORKSPACE/compile_script/matrix_job_status.sh "${{ github.token }}" "${{ github.repository }}" "${{ github.run_id }}" "${{ fromJSON(github.run_attempt) }}" "Upload-${{ matrix.source_code_platform }}-${{ matrix.platform }}"
+
+      - name: Initialization Environment
+        id: init
+        if: steps.matrix_status.outputs.status != 'success'
+        run: |
+          sudo timedatectl set-timezone "$TZ"
+          cd $GITHUB_WORKSPACE
+          sudo mkdir -p release_download release_tag_download
+          sudo chown -R $USER:$GROUPS release_download release_tag_download
+          echo "release_dir=$PWD/release_download" >> $GITHUB_OUTPUT
+          echo "release_tag_dir=$PWD/release_tag_download" >> $GITHUB_OUTPUT
+
+      - name: Download Release From Artifacts
+        id : download
+        if: steps.matrix_status.outputs.status != 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ matrix.source_code_platform }}_${{ matrix.platform }}_firmware
+          path: ${{ steps.init.outputs.release_dir }}
+
+      - name: Download Tags
+        if: steps.matrix_status.outputs.status != 'success'
+        uses: actions/download-artifact@v8
+        with:
+          name: release_tag
+          path: ${{ steps.init.outputs.release_tag_dir }}
+
+      - name: Upload Firmware To Release
+        if: steps.matrix_status.outputs.status != 'success'
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_ADMIN_PAT }}
+        with:
+          tag_name: ${{ needs.job_init.outputs.output_release_tag }}
+          body_path: ${{ steps.init.outputs.release_tag_dir }}/release.txt
+          files: |
+            ${{ steps.init.outputs.release_dir }}/*
+
+  job_organize_tags:
+    needs: [job_init, job_source_init, job_generate_release_tag, job_build, job_upload_release]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    name: Organize-Release-Tags
+    outputs:
+      output_tag_status: ${{ steps.organize_tags.outputs.status }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Pull the latest changes
+        run: git pull origin ${{ github.ref_name }}
+
+      - name: Download Tags
+        uses: actions/download-artifact@v8
+        with:
+          name: release_tag
+
+      - name: Organize Tags
+        id: organize_tags
+        run: |
+            chmod +x compile_script/step07_organize_tag.sh
+            $GITHUB_WORKSPACE/compile_script/step07_organize_tag.sh "${{ github.token }}" "${{ github.repository }}" "${{ github.run_id }}" "${{ fromJSON(github.run_attempt) }}" "3"
+
+      - name: Upload Tags To Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release_tag_final_attempt_${{ fromJSON(github.run_attempt) }}
+          path: release.txt
+          retention-days: 5
+
+      - name: Update Release Tag
+        uses: softprops/action-gh-release@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.MY_ADMIN_PAT }}
+        with:
+          tag_name: ${{ needs.job_init.outputs.output_release_tag }}
+          body_path: release.txt
+
+  rerun-failed-jobs:
+    runs-on: ubuntu-latest
+    needs: [job_init, job_source_init, job_generate_release_tag, job_build, job_upload_release, job_organize_tags]
+    if: failure() && fromJSON(github.run_attempt) < 3  && !cancelled()
+    steps:
+      - name: Rerun failed jobs in the current workflow
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Retry failed jobs for the ${{ fromJSON(github.run_attempt) }} time, Retry 3 times in total"
+          gh workflow run Retry_Failure_Jobs.yml -F run_id=${{ github.run_id }}
+
+  final-execution-jobs:
+    runs-on: ubuntu-latest
+    needs: [rerun-failed-jobs, job_organize_tags]
+    if: ${{ always() && !cancelled() }}
+    steps:
+      - name: Trigger build
+        if: ${{ needs.rerun-failed-jobs.result == 'skipped' }}
+        uses: peter-evans/repository-dispatch@v4
+        with:
+          token: ${{ secrets.MY_ADMIN_PAT }}
+          repository: ${{ github.repository }}
+          event-type: openwrt_compilation_completed

@@ -1,0 +1,93 @@
+#
+# Copyright (c) 2019-2026 smallprogram / x86-openwrtHello
+#
+# This is free software, licensed under the MIT License.
+# See /LICENSE for more information.
+#
+# https://github.com/zhb7670/x86-openwrtHello
+# File: .github/workflows/Update_Checker.yml
+# Description: Source code update checker - X86 only
+#
+
+name: Update_Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh:
+        description: 'SSH connection to Actions'
+        required: false
+        default: 'false'
+  schedule:
+    - cron: '0 0 * * 2,5'
+      # 每周二、周五 00:00 检查更新 (Asia/Shanghai 08:00)
+      # 可自行修改 cron 表达式调整检查频率
+
+permissions:
+  contents: write
+  packages: write
+  actions: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+
+    steps:
+
+    - name: SSH connection to Actions
+      uses: P3TERX/ssh2actions@v1.0.0
+      if: (github.event.inputs.ssh == 'true' && github.event.inputs.ssh  != 'false') || contains(github.event.action, 'ssh')
+
+    - name: Checkout
+      uses: actions/checkout@v6
+
+    - name: Get Commit Hash
+      id: getHash
+      run: |
+        chmod +x compile_script/update_checker.sh
+        $GITHUB_WORKSPACE/compile_script/update_checker.sh
+
+    - name: Compare Commit Hash
+      id: cacheHash
+      uses: actions/cache@v5
+      with:
+        path: .commitHash_All
+        key: HEAD-${{ steps.getHash.outputs.FINAL_HASH }}
+
+    - name: Save New Commit Hash
+      if: steps.cacheHash.outputs.cache-hit != 'true'
+      run: |
+        echo ${{ steps.getHash.outputs.HASH_STRING }} | tee .commitHash_All
+
+    - name: Delete workflow runs
+      uses: Mattraks/delete-workflow-runs@main
+      with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          retain_days: 90
+          keep_minimum_runs: 3
+
+    - name: Remove old Releases
+      uses: dev-drprasad/delete-older-releases@master
+      with:
+        keep_latest: 10
+        keep_min_download_counts: 2
+        delete_expired_data: 30
+        delete_tags: true
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: ghcr.io cleanup action
+      uses: dataaxiom/ghcr-cleanup-action@v1
+      with:
+        delete-untagged: true
+        packages: openwrt-full-cache*
+        expand-packages: true
+        token: ${{ secrets.MY_ADMIN_PAT }}
+
+    - name: Trigger build
+      if: steps.cacheHash.outputs.cache-hit != 'true'
+      uses: peter-evans/repository-dispatch@main
+      with:
+        token: ${{ secrets.MY_ADMIN_PAT }}
+        event-type: openwrt_source_update_v6
